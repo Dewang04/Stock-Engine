@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import time
-from difflib import SequenceMatcher
 
 import requests
 
@@ -14,7 +13,7 @@ BSE_CASES = ["539997", "524500", "532989"]
 
 NSE_HOME = "https://www.nseindia.com/"
 NSE_API = "https://www.nseindia.com/api/quote-equity"
-BSE_MOBILE = "https://m.bseindia.com/StockReach.aspx?scripcode={}"
+BSE_MOBILE = "https://m.bseindia.com/StockReach.aspx?scripcd={}"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -76,7 +75,6 @@ def nse_smoke(case):
             bool(industry.get(k))
             for k in ("macro", "sector", "industry", "basicIndustry")
         )
-        # Preserve the raw response for smoke-test auditability without logging secrets.
         result["raw_response_keys"] = sorted(data.keys())
         if expected_isin and returned_isin and returned_isin.upper() != expected_isin.upper():
             result["error"] = "identity_mismatch_isin"
@@ -89,23 +87,30 @@ def nse_smoke(case):
 
 
 def extract_bse_fields(html):
-    # Mobile quote is HTML. Keep extraction deliberately conservative: first look
-    # for labelled fields rather than guessing a value from arbitrary page text.
+    """Extract only values explicitly anchored to their labels.
+
+    This intentionally fails closed. It does not infer fields from positional
+    table cells, because BSE template changes must not create false evidence.
+    """
     from html import unescape
     import re
 
     text = unescape(re.sub(r"<[^>]+>", " ", html))
     text = re.sub(r"\s+", " ", text).strip()
 
-    def labelled(label):
-        m = re.search(rf"{re.escape(label)}\s*[:\-]?\s*([^|;]+?)(?=\s+(?:Security Code|ISIN|Industry|Scrip Name|Company Name)\b|$)", text, re.I)
-        return m.group(1).strip() if m else None
+    labels = ["Security Code", "ISIN", "Industry", "Scrip Name", "Company Name"]
+    pattern = r"(?P<label>" + "|".join(re.escape(x) for x in labels) + r")\s*[:\-]?\s*(?P<value>.*?)(?=\s+(?:" + "|".join(re.escape(x) for x in labels) + r")\b|$)"
+    fields = {}
+    for m in re.finditer(pattern, text, re.I):
+        value = m.group("value").strip(" :|-\t")
+        if value:
+            fields[m.group("label").lower()] = value
 
     return {
-        "security_code": labelled("Security Code"),
-        "isin": labelled("ISIN"),
-        "industry": labelled("Industry"),
-        "scrip_name": labelled("Scrip Name") or labelled("Company Name"),
+        "security_code": fields.get("security code"),
+        "isin": fields.get("isin"),
+        "industry": fields.get("industry"),
+        "scrip_name": fields.get("scrip name") or fields.get("company name"),
         "text_length": len(text),
     }
 
@@ -126,20 +131,26 @@ def bse_smoke(scrip_code):
         if response.status_code >= 400:
             result["error"] = f"http_{response.status_code}"
             return result
+
         fields = extract_bse_fields(response.text)
         result["returned_identity"] = fields
         result["classification_present"] = bool(fields.get("industry"))
         returned_code = fields.get("security_code")
+        returned_isin = fields.get("isin")
         result["scrip_code_match"] = (
             None if not returned_code else returned_code.strip().lstrip("0") == scrip_code.lstrip("0")
         )
-        # Do not claim an identity match if the endpoint did not echo a usable code/ISIN.
-        if returned_code and not result["scrip_code_match"]:
-            result["error"] = "identity_mismatch_scrip_code"
-        elif not returned_code and not fields.get("isin"):
-            result["identity_validation"] = "WEAK_NAME_ONLY_OR_UNAVAILABLE"
+
+        if returned_code:
+            if not result["scrip_code_match"]:
+                result["error"] = "identity_mismatch_scrip_code"
+            else:
+                result["identity_validation"] = "CODE_PRESENT"
+        elif returned_isin:
+            result["identity_validation"] = "ISIN_PRESENT"
         else:
-            result["identity_validation"] = "CODE_OR_ISIN_PRESENT"
+            result["identity_validation"] = "IDENTITY_FIELDS_MISSING"
+            result["error"] = "identity_unavailable"
     except requests.RequestException as exc:
         result["error"] = f"request_error:{type(exc).__name__}:{exc}"
     finally:
