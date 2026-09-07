@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 import re
@@ -52,9 +54,9 @@ def identity_check(job, raw):
         norm((job.get("companies") or {}).get("common_name")),
     } - {""}
 
-    tickers = {norm(x) for x in first_values(raw, ["symbol", "ticker", "scripcode", "securityCode", "SCRIP_CD"])}
-    isins = {norm(x) for x in first_values(raw, ["isin", "isinCode", "ISIN", "ISIN_NUMBER"])}
-    names = {norm(x) for x in first_values(raw, ["companyName", "company", "securityName", "issuerName", "name", "Scrip_Name", "Issuer_Name"])}
+    tickers = {norm(x) for x in first_values(raw, ["symbol", "ticker", "scripcode", "securityCode", "SCRIP_CD", "Scrip Code"])}
+    isins = {norm(x) for x in first_values(raw, ["isin", "isinCode", "ISIN", "ISIN_NUMBER", "ISIN No", "ISIN No."])}
+    names = {norm(x) for x in first_values(raw, ["companyName", "company", "securityName", "issuerName", "name", "Scrip_Name", "Issuer_Name", "Security Name"])}
 
     ticker_ok = not expected_ticker or expected_ticker in tickers
     isin_ok = not expected_isin or expected_isin in isins
@@ -75,8 +77,6 @@ def identity_check(job, raw):
 
 
 def nse_page_raw(page, ticker):
-    # NSE's public quote page is accessible through a normal browser session even
-    # when the underlying /api/quote-equity endpoint is blocked by Akamai.
     url = f"https://www.nseindia.com/get-quotes/equity?symbol={ticker}"
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(2500)
@@ -96,10 +96,10 @@ def nse_page_raw(page, ticker):
     if m:
         isin = m.group(1)
 
-    # Keep the evidence compact but retain enough page text to audit the source.
     return {
         "symbol": ticker,
         "isin": isin,
+        "companyName": title,
         "basicIndustry": basic_industry,
         "page_title": title,
         "page_url": url,
@@ -113,9 +113,6 @@ def bse_api_raw(request, ticker):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
         "Referer": "https://www.bseindia.com/",
     }
-    # Do NOT constrain Group=A or status=Active. The pharma seed contains B-group,
-    # SME and otherwise non-A securities; Group=A was incorrectly making valid
-    # BSE scrips look nonexistent.
     url = f"https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?scripcode={ticker}&Group=&industry=&segment=Equity&status="
     response = request.get(url, headers=headers, timeout=60000, fail_on_status_code=False)
     if not response.ok:
@@ -126,6 +123,59 @@ def bse_api_raw(request, ticker):
     return raw, url
 
 
+def bse_csv_raw(request, ticker):
+    """Fetch BSE's reference-security CSV and extract this scrip's industry."""
+    headers = {
+        "Accept": "text/csv, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
+        "Referer": "https://www.bseindia.com/",
+    }
+    url = f"https://api.bseindia.com/BseIndiaAPI/api/LitsOfScripCSVDownload/w?segment=Equity&status=Active&industry=&Group=&Scripcode={ticker}"
+    response = request.get(url, headers=headers, timeout=60000, fail_on_status_code=False)
+    if not response.ok:
+        raise RuntimeError(f"BSE CSV HTTP {response.status}: {response.text()[:500]}")
+
+    text = response.text.lstrip("\ufeff")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        raise RuntimeError(f"BSE CSV returned no rows for scripcode {ticker}")
+
+    def pick(row, candidates):
+        by_norm = {norm(k).replace(" ", ""): v for k, v in row.items() if k is not None}
+        for key in candidates:
+            value = by_norm.get(norm(key).replace(" ", ""))
+            if value not in (None, ""):
+                return value.strip()
+        return None
+
+    target = norm(ticker)
+    matches = []
+    for row in rows:
+        code = pick(row, ["Scrip Code", "SCRIP_CD", "Scripcode", "Security Code"])
+        if norm(code) == target:
+            matches.append(row)
+
+    if not matches:
+        # Some BSE CSV versions omit the code label but still expose the security
+        # symbol/ISIN. Return no classification rather than guessing a row.
+        raise RuntimeError(f"BSE CSV returned no matching row for scripcode {ticker}")
+
+    row = matches[0]
+    industry = pick(row, ["Industry", "INDUSTRY"])
+    if not industry:
+        raise RuntimeError(f"BSE authoritative CSV has no industry for scripcode {ticker}")
+
+    return {
+        "SCRIP_CD": pick(row, ["Scrip Code", "SCRIP_CD", "Scripcode", "Security Code"]) or ticker,
+        "ISIN_NUMBER": pick(row, ["ISIN", "ISIN_NUMBER", "ISIN No", "ISIN No."]),
+        "Scrip_Name": pick(row, ["Scrip Name", "Scrip_Name", "Security Name", "Company Name"]),
+        "Issuer_Name": pick(row, ["Issuer Name", "Issuer_Name"]),
+        "INDUSTRY": industry,
+        "raw_csv_row": row,
+    }, url
+
+
 def fetch_exchange(page, request, mic, ticker):
     if mic == "XNSE":
         return nse_page_raw(page, ticker)
@@ -134,7 +184,11 @@ def fetch_exchange(page, request, mic, ticker):
             page.goto("https://www.bseindia.com/", wait_until="domcontentloaded", timeout=60000)
         except Exception:
             pass
-        return bse_api_raw(request, ticker)
+        meta, meta_url = bse_api_raw(request, ticker)
+        # ListofScripData gives strong exchange identity but currently returns
+        # INDUSTRY=null. Obtain the actual industry from BSE's reference CSV.
+        industry, industry_url = bse_csv_raw(request, ticker)
+        return {"security_metadata": meta, "industry_reference": industry}, f"{meta_url} | {industry_url}"
     raise RuntimeError(f"unsupported MIC {mic}")
 
 
@@ -145,14 +199,12 @@ def extract_classification(raw, mic):
             raise RuntimeError("NSE quote page contained no Basic Industry classification")
         return {"basicIndustry": basic}
 
-    if isinstance(raw, dict):
-        candidates = []
-        for key in ("industryInfo", "industry", "Industry", "basicIndustry", "BasicIndustry", "sector", "Sector", "Table", "table"):
-            if key in raw:
-                candidates.append({key: raw[key]})
-        return candidates[0] if len(candidates) == 1 else (raw if raw else {})
-    if isinstance(raw, list):
-        return raw[0] if raw else {}
+    if mic == "XBOM":
+        ref = raw.get("industry_reference") if isinstance(raw, dict) else None
+        if not isinstance(ref, dict) or not ref.get("INDUSTRY"):
+            raise RuntimeError("BSE reference response contained no Industry classification")
+        return {"industry": ref["INDUSTRY"]}
+
     return raw
 
 
@@ -169,19 +221,16 @@ def process_job(page, request, job):
         identity_raw = {
             "symbol": raw.get("symbol"),
             "isin": raw.get("isin"),
-            "companyName": raw.get("page_title"),
+            "companyName": raw.get("companyName"),
         }
     else:
-        identity_raw = raw
+        identity_raw = raw.get("security_metadata") or raw.get("industry_reference") or raw
 
     identity = identity_check(job, identity_raw)
     if not identity["passed"]:
         raise RuntimeError("identity validation failed: " + json.dumps(identity, separators=(",", ":")))
 
     classification = extract_classification(raw, mic)
-    if not classification:
-        raise RuntimeError("authoritative response contained no classification payload")
-
     source_system = "NSE_INDICES_INDUSTRY_CLASSIFICATION" if mic == "XNSE" else "BSE_INDUSTRY_CLASSIFICATION"
     return {
         "mode": "github_ingest",
@@ -230,9 +279,6 @@ def main():
                     print(f"failed to reset queue item: {reset_exc}", file=sys.stderr)
         browser.close()
 
-    # Per-security failures are recorded in Supabase and returned to PENDING.
-    # The worker itself completed its batch successfully, so don't turn ordinary
-    # data-quality misses into a red GitHub workflow.
     print(json.dumps({"status": "COMPLETED", "claimed": len(jobs), "resolved": resolved, "failed": failed}))
     return 0
 
