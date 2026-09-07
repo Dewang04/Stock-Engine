@@ -1,28 +1,24 @@
-name: India Exchange Browser Worker
+name: India Exchange Targeted Smoke Test
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - 'workers/india_exchange_browser_worker.py'
-      - 'workers/india_classification_source_probe.py'
+      - 'workers/india_targeted_smoke_test.py'
       - '.github/workflows/india-exchange-browser-worker.yml'
-      - 'requirements.txt'
-  schedule:
-    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: stock-engine-india-exchange-worker
-  cancel-in-progress: false
+  group: stock-engine-india-targeted-smoke-test
+  cancel-in-progress: true
 
 jobs:
-  validate-india-exchanges:
+  targeted-smoke-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,22 +29,8 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check requests==2.32.5
 
-      - name: Probe India classification sources
-        run: python workers/india_classification_source_probe.py
-
-      - name: Run browser worker
-        env:
-          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
-          GPEIS_WORKER_TOKEN: ${{ secrets.GPEIS_WORKER_TOKEN }}
-          BATCH_SIZE: '5'
-        run: python workers/india_exchange_browser_worker.py
-
-      - name: Worker summary
-        if: always()
-        run: echo "India exchange classification worker finished; inspect the run logs for per-record results."
+      - name: Run targeted NSE/BSE smoke test
+        run: python workers/india_targeted_smoke_test.py
