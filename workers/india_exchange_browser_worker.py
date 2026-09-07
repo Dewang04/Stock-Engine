@@ -12,6 +12,7 @@ from playwright.sync_api import sync_playwright
 FUNCTION_URL = os.environ.get("SUPABASE_FUNCTION_URL", "https://lkqdyyqawxtjqobaqwff.supabase.co/functions/v1/pharma-universe-classifier-v1")
 WORKER_TOKEN = os.environ["GPEIS_WORKER_TOKEN"]
 BATCH_SIZE = min(max(int(os.environ.get("BATCH_SIZE", "5")), 1), 10)
+BSE_CSV_CACHE = None
 
 
 def norm(value):
@@ -132,47 +133,18 @@ def bse_api_raw(request, ticker):
     return raw, url
 
 
-def bse_csv_raw(request, ticker):
-    """Fetch BSE's reference-security CSV and extract this scrip's industry."""
-    headers = {
-        "Accept": "text/csv, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
-        "Referer": "https://www.bseindia.com/",
-    }
-    url = f"https://api.bseindia.com/BseIndiaAPI/api/LitsOfScripCSVDownload/w?segment=Equity&status=Active&industry=&Group=&Scripcode={ticker}"
-    response = request.get(url, headers=headers, timeout=60000, fail_on_status_code=False)
-    if not response.ok:
-        raise RuntimeError(f"BSE CSV HTTP {response.status}: {response.text()[:500]}")
-
-    text = response.text().lstrip("\ufeff")
-    reader = csv.DictReader(io.StringIO(text))
-    rows = list(reader)
-    if not rows:
-        raise RuntimeError(f"BSE CSV returned no rows for scripcode {ticker}")
-
-    def pick(row, candidates):
-        by_norm = {norm(k).replace(" ", ""): v for k, v in row.items() if k is not None}
+def _bse_csv_row_to_reference(row, ticker):
+    def pick(row_obj, candidates):
+        by_norm = {norm(k).replace(" ", ""): v for k, v in row_obj.items() if k is not None}
         for key in candidates:
             value = by_norm.get(norm(key).replace(" ", ""))
             if value not in (None, ""):
                 return value.strip()
         return None
 
-    target = norm(ticker)
-    matches = []
-    for row in rows:
-        code = pick(row, ["Scrip Code", "SCRIP_CD", "Scripcode", "Security Code"])
-        if norm(code) == target:
-            matches.append(row)
-
-    if not matches:
-        raise RuntimeError(f"BSE CSV returned no matching row for scripcode {ticker}")
-
-    row = matches[0]
     industry = pick(row, ["Industry", "INDUSTRY"])
     if not industry:
-        raise RuntimeError(f"BSE authoritative CSV has no industry for scripcode {ticker}")
-
+        return None
     return {
         "SCRIP_CD": pick(row, ["Scrip Code", "SCRIP_CD", "Scripcode", "Security Code"]) or ticker,
         "ISIN_NUMBER": pick(row, ["ISIN", "ISIN_NUMBER", "ISIN No", "ISIN No."]),
@@ -180,7 +152,48 @@ def bse_csv_raw(request, ticker):
         "Issuer_Name": pick(row, ["Issuer Name", "Issuer_Name"]),
         "INDUSTRY": industry,
         "raw_csv_row": row,
-    }, url
+    }
+
+
+def _download_bse_reference_csv(request):
+    global BSE_CSV_CACHE
+    if BSE_CSV_CACHE is not None:
+        return BSE_CSV_CACHE
+
+    headers = {
+        "Accept": "text/csv, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
+        "Referer": "https://www.bseindia.com/",
+    }
+    url = "https://api.bseindia.com/BseIndiaAPI/api/LitsOfScripCSVDownload/w?segment=Equity&status=Active&industry=&Group=&Scripcode="
+    response = request.get(url, headers=headers, timeout=60000, fail_on_status_code=False)
+    if not response.ok:
+        raise RuntimeError(f"BSE CSV HTTP {response.status}: {response.text()[:500]}")
+
+    text = response.text().lstrip("\ufeff")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        raise RuntimeError("BSE authoritative CSV returned no rows")
+
+    BSE_CSV_CACHE = (rows, url)
+    return BSE_CSV_CACHE
+
+
+def bse_csv_raw(request, ticker):
+    """Fetch BSE's full official reference-security CSV once and extract this scrip's industry."""
+    rows, url = _download_bse_reference_csv(request)
+    target = norm(ticker)
+
+    for row in rows:
+        code = next((str(row.get(k, "")).strip() for k in row if norm(k).replace(" ", "") in {"SCRIPCODE", "SCRIPCD", "SECURITYCODE", "SCRIPCODE"}), None)
+        if norm(code) != target:
+            continue
+        reference = _bse_csv_row_to_reference(row, ticker)
+        if reference:
+            return reference, url
+        raise RuntimeError(f"BSE authoritative CSV has no industry for scripcode {ticker}")
+
+    raise RuntimeError(f"BSE authoritative CSV returned no matching row for scripcode {ticker}")
 
 
 def fetch_exchange(page, request, mic, ticker):
