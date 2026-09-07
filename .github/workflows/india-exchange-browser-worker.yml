@@ -2,6 +2,12 @@ name: India Exchange Browser Worker
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'workers/india_exchange_browser_worker.py'
+      - '.github/workflows/india-exchange-browser-worker.yml'
+      - 'requirements.txt'
   schedule:
     - cron: '*/15 * * * *'
 
