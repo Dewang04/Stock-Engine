@@ -135,7 +135,7 @@ def bse_csv_raw(request, ticker):
     if not response.ok:
         raise RuntimeError(f"BSE CSV HTTP {response.status}: {response.text()[:500]}")
 
-    text = response.text.lstrip("\ufeff")
+    text = response.text().lstrip("\ufeff")
     reader = csv.DictReader(io.StringIO(text))
     rows = list(reader)
     if not rows:
@@ -157,8 +157,6 @@ def bse_csv_raw(request, ticker):
             matches.append(row)
 
     if not matches:
-        # Some BSE CSV versions omit the code label but still expose the security
-        # symbol/ISIN. Return no classification rather than guessing a row.
         raise RuntimeError(f"BSE CSV returned no matching row for scripcode {ticker}")
 
     row = matches[0]
@@ -185,8 +183,6 @@ def fetch_exchange(page, request, mic, ticker):
         except Exception:
             pass
         meta, meta_url = bse_api_raw(request, ticker)
-        # ListofScripData gives strong exchange identity but currently returns
-        # INDUSTRY=null. Obtain the actual industry from BSE's reference CSV.
         industry, industry_url = bse_csv_raw(request, ticker)
         return {"security_metadata": meta, "industry_reference": industry}, f"{meta_url} | {industry_url}"
     raise RuntimeError(f"unsupported MIC {mic}")
