@@ -44,12 +44,17 @@ def identity_check(job, raw):
     expected_ticker = norm(metadata.get("ticker") or job.get("ticker") or job.get("source_record_key"))
     expected_isin = norm(metadata.get("isin") or job.get("isin"))
     expected_names = {norm(job.get("legal_name")), norm(job.get("common_name")), norm((job.get("companies") or {}).get("legal_name")), norm((job.get("companies") or {}).get("common_name"))} - {""}
-    tickers = {norm(x) for x in first_values(raw, ["symbol", "ticker", "scripcode", "securityCode", "Symbol"])}
-    isins = {norm(x) for x in first_values(raw, ["isin", "isinCode", "ISIN"])}
-    names = {norm(x) for x in first_values(raw, ["companyName", "company", "securityName", "issuerName", "name"])}
+    tickers = {norm(x) for x in first_values(raw, ["symbol", "ticker", "scripcode", "securityCode", "Symbol", "SCRIP_CD"])}
+    isins = {norm(x) for x in first_values(raw, ["isin", "isinCode", "ISIN", "ISIN_NUMBER"])}
+    names = {norm(x) for x in first_values(raw, ["companyName", "company", "securityName", "issuerName", "name", "Scrip_Name", "Issuer_Name"])}
+
+    # BSE's ListofScripData endpoint can return a list; its identity fields are
+    # SCRIP_CD / ISIN_NUMBER / Scrip_Name rather than NSE's symbol / isin / companyName.
     ticker_ok = not expected_ticker or expected_ticker in tickers
     isin_ok = not expected_isin or expected_isin in isins
     name_ok = not expected_names or any(a == b or a in b or b in a for a in expected_names for b in names if b)
+
+    # Require the exchange ticker/scrip code plus one independent identifier.
     strong = ticker_ok and (isin_ok or name_ok or (not expected_isin and not expected_names))
     return {"passed": bool(strong), "expected_ticker": expected_ticker, "observed_tickers": sorted(tickers), "expected_isin": expected_isin, "observed_isins": sorted(isins), "expected_names": sorted(expected_names), "observed_names": sorted(names)[:10], "ticker_match": ticker_ok, "isin_match": isin_ok, "name_match": name_ok}
 
@@ -76,7 +81,11 @@ def fetch_exchange(page, request, mic, ticker):
         response = request.get(url, headers={**headers, "Referer": "https://www.bseindia.com/"}, timeout=60000, fail_on_status_code=False)
         if not response.ok:
             raise RuntimeError(f"BSE HTTP {response.status}: {response.text()[:500]}")
-        return response.json(), url
+        raw = response.json()
+        # An empty BSE result is not evidence. Fail explicitly instead of resolving it.
+        if raw == [] or raw == {} or raw is None:
+            raise RuntimeError(f"BSE returned no record for scripcode {ticker}")
+        return raw, url
     raise RuntimeError(f"unsupported MIC {mic}")
 
 
