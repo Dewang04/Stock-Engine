@@ -78,10 +78,19 @@ def identity_check(job, raw):
 
 def nse_page_raw(page, ticker):
     url = f"https://www.nseindia.com/get-quotes/equity?symbol={ticker}"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(2500)
-    text = page.locator("body").inner_text(timeout=30000)
-    title = page.title()
+    last_error = None
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2500)
+            text = page.locator("body").inner_text(timeout=30000)
+            title = page.title()
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == 1:
+                raise RuntimeError(f"NSE quote page failed for {ticker}: {last_error}")
+            page.wait_for_timeout(3000)
 
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
@@ -227,7 +236,7 @@ def process_job(page, request, job):
         raise RuntimeError("identity validation failed: " + json.dumps(identity, separators=(",", ":")))
 
     classification = extract_classification(raw, mic)
-    source_system = "NSE_INDICES_INDUSTRY_CLASSIFICATION" if mic == "XNSE" else "BSE_INDUSTRY_CLASSIFICATION"
+    source_system = "NSE_INDUSTRY_CLASSIFICATION" if mic == "XNSE" else "BSE_INDUSTRY_CLASSIFICATION"
     return {
         "mode": "github_ingest",
         "queue_id": job["queue_id"],
