@@ -87,24 +87,31 @@ def nse_smoke(case):
 
 
 def extract_bse_fields(html):
-    """Extract only values explicitly anchored to their labels.
-
-    This intentionally fails closed. It does not infer fields from positional
-    table cells, because BSE template changes must not create false evidence.
-    """
+    """Extract only values explicitly anchored to labels; fail closed."""
     from html import unescape
     import re
 
     text = unescape(re.sub(r"<[^>]+>", " ", html))
     text = re.sub(r"\s+", " ", text).strip()
 
-    labels = ["Security Code", "ISIN", "Industry", "Scrip Name", "Company Name"]
-    pattern = r"(?P<label>" + "|".join(re.escape(x) for x in labels) + r")\s*[:\-]?\s*(?P<value>.*?)(?=\s+(?:" + "|".join(re.escape(x) for x in labels) + r")\b|$)"
     fields = {}
-    for m in re.finditer(pattern, text, re.I):
-        value = m.group("value").strip(" :|-\t")
-        if value:
-            fields[m.group("label").lower()] = value
+    # Security Code is rendered as e.g. '524500 Group / Index T / Face value 10.00'.
+    # Capture only the numeric token immediately following the label.
+    m = re.search(r"Security\s+Code\s*[:\-]?\s*(\d{6})\b", text, re.I)
+    if m:
+        fields["security code"] = m.group(1)
+
+    # Other fields remain label-anchored and conservative.
+    for label, key in (("ISIN", "isin"), ("Industry", "industry"), ("Scrip Name", "scrip name"), ("Company Name", "company name")):
+        m = re.search(
+            rf"{re.escape(label)}\s*[:\-]?\s*(.*?)(?=\s+(?:Security\s+Code|ISIN|Industry|Scrip\s+Name|Company\s+Name)\b|$)",
+            text,
+            re.I,
+        )
+        if m:
+            value = m.group(1).strip(" :|-\t")
+            if value:
+                fields[key] = value
 
     return {
         "security_code": fields.get("security code"),
