@@ -44,3 +44,7 @@ jobs:
           GPEIS_WORKER_TOKEN: ${{ secrets.GPEIS_WORKER_TOKEN }}
           BATCH_SIZE: '5'
         run: python workers/india_exchange_browser_worker.py
+
+      - name: Worker summary
+        if: always()
+        run: echo "India exchange classification worker finished; inspect the run logs for per-record results."
